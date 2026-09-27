@@ -6,10 +6,516 @@
     name="viewport"
     content="width=device-width, initial-scale=1"
   >
+
   <title>Barcode Scanner</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #eef2f7;
+      color: #1f2937;
+      font-family: Arial, sans-serif;
+    }
+
+    main {
+      max-width: 520px;
+      margin: auto;
+      padding: 20px;
+      border-radius: 16px;
+      background: white;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 24px;
+    }
+
+    p {
+      line-height: 1.5;
+    }
+
+    video {
+      display: block;
+      width: 100%;
+      min-height: 220px;
+      max-height: 65vh;
+      margin: 16px 0;
+      border-radius: 12px;
+      background: #111827;
+      object-fit: contain;
+    }
+
+    button,
+    input {
+      width: 100%;
+      padding: 14px;
+      margin-top: 10px;
+      border-radius: 10px;
+      font-size: 16px;
+    }
+
+    button {
+      border: 0;
+      background: #2563eb;
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
+
+    #stopButton {
+      background: #dc2626;
+    }
+
+    #stopButton:disabled {
+      background: #9ca3af;
+    }
+
+    input {
+      border: 1px solid #d1d5db;
+      background: white;
+      color: #111827;
+    }
+
+    #status {
+      padding: 12px;
+      border-radius: 10px;
+      background: #eff6ff;
+      overflow-wrap: anywhere;
+    }
+
+    .hint {
+      color: #6b7280;
+      font-size: 13px;
+    }
+  </style>
 </head>
+
 <body>
-  <h1>Scanner hosting is ready</h1>
-  <p>The camera scanner will be installed here next.</p>
+  <main>
+    <h1>Scan Barcode</h1>
+
+    <p>
+      Tap Start camera, allow access, and point the rear
+      camera at the barcode.
+    </p>
+
+    <button id="startButton" type="button">
+      Start camera
+    </button>
+
+    <button id="stopButton" type="button" disabled>
+      Stop camera
+    </button>
+
+    <video
+      id="video"
+      autoplay
+      muted
+      playsinline
+    ></video>
+
+    <p id="status" role="status" aria-live="polite">
+      Ready to start.
+    </p>
+
+    <label for="result">Scanned barcode</label>
+
+    <input
+      id="result"
+      type="text"
+      readonly
+      autocomplete="off"
+      placeholder="The scanned code appears here"
+    >
+
+    <button id="copyButton" type="button" disabled>
+      Copy code
+    </button>
+
+    <p class="hint">
+      If the code does not return automatically, copy it,
+      switch back to the Data Entry tab, and paste it into
+      Barcode / Code.
+    </p>
+  </main>
+
+  <script>
+    const video = document.getElementById("video");
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const copyButton = document.getElementById("copyButton");
+    const resultInput = document.getElementById("result");
+    const statusElement = document.getElementById("status");
+
+    let cameraStream = null;
+    let scanTimer = null;
+    let session = 0;
+
+    let waitingForAcknowledgment = false;
+    let acknowledgmentTimer = null;
+
+    /*
+     * Apps Script passes its origin and a random session token
+     * in the URL fragment. The fragment is not sent to the
+     * GitHub Pages server as part of the page request.
+     */
+    const parameters = new URLSearchParams(
+      window.location.hash.slice(1)
+    );
+
+    const suppliedOrigin = parameters.get("origin") || "";
+    const returnToken = parameters.get("token") || "";
+
+    let returnOrigin = null;
+
+    try {
+      const parsedOrigin = new URL(suppliedOrigin);
+
+      const isAppsScriptHost =
+        parsedOrigin.hostname === "script.google.com" ||
+        parsedOrigin.hostname.endsWith(".googleusercontent.com");
+
+      if (
+        parsedOrigin.protocol === "https:" &&
+        parsedOrigin.origin === suppliedOrigin &&
+        isAppsScriptHost &&
+        /^[0-9a-f]{32}$/.test(returnToken)
+      ) {
+        returnOrigin = suppliedOrigin;
+      }
+    } catch (error) {
+      // Direct visits have no return connection.
+      // Scanning and manual copying can still work.
+    }
+
+    function setStatus(message) {
+      statusElement.textContent = message;
+    }
+
+    function stopCamera() {
+      // Invalidate pending startup or detection operations.
+      session += 1;
+
+      clearTimeout(scanTimer);
+      scanTimer = null;
+
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(function(track) {
+          track.stop();
+        });
+        cameraStream = null;
+      }
+
+      video.pause();
+      video.srcObject = null;
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+    }
+
+    async function startCamera() {
+      stopCamera();
+
+      const currentSession = session;
+
+      clearTimeout(acknowledgmentTimer);
+      waitingForAcknowledgment = false;
+
+      resultInput.value = "";
+      copyButton.disabled = true;
+
+      startButton.disabled = true;
+      stopButton.disabled = false;
+
+      setStatus("Checking scanner support...");
+
+      try {
+        if (
+          !window.isSecureContext ||
+          !navigator.mediaDevices ||
+          !navigator.mediaDevices.getUserMedia
+        ) {
+          throw new Error(
+            "Camera access is unavailable. Open this HTTPS " +
+            "scanner page directly in Chrome."
+          );
+        }
+
+        if (!("BarcodeDetector" in window)) {
+          throw new Error(
+            "Native barcode detection is unavailable in this " +
+            "browser. Try an updated Chrome on Android. If the " +
+            "message remains, this device needs a different " +
+            "barcode-decoding implementation."
+          );
+        }
+
+        let detector;
+
+        if (
+          typeof BarcodeDetector.getSupportedFormats === "function"
+        ) {
+          const supportedFormats =
+            await BarcodeDetector.getSupportedFormats();
+
+          if (currentSession !== session) {
+            return;
+          }
+
+          if (!supportedFormats.length) {
+            throw new Error(
+              "This browser reports no supported barcode formats."
+            );
+          }
+
+          detector = new BarcodeDetector({
+            formats: supportedFormats
+          });
+        } else {
+          detector = new BarcodeDetector();
+        }
+
+        setStatus("Requesting camera access...");
+
+        const requestedStream =
+          await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: {
+                ideal: "environment"
+              },
+              width: {
+                ideal: 1280
+              },
+              height: {
+                ideal: 720
+              }
+            },
+            audio: false
+          });
+
+        // Stop a late camera response if the user already canceled.
+        if (currentSession !== session) {
+          requestedStream.getTracks().forEach(function(track) {
+            track.stop();
+          });
+          return;
+        }
+
+        cameraStream = requestedStream;
+        video.srcObject = requestedStream;
+
+        await video.play();
+
+        if (currentSession !== session) {
+          return;
+        }
+
+        setStatus(
+          "Point at the barcode. Keep it well lit and in focus."
+        );
+
+        detectFrame(currentSession, detector);
+      } catch (error) {
+        if (currentSession !== session) {
+          return;
+        }
+
+        stopCamera();
+
+        if (error.name === "NotAllowedError") {
+          setStatus(
+            "Camera access was not granted to this external " +
+            "scanner page. Check permission for this GitHub " +
+            "Pages site and Chrome's Android camera permission."
+          );
+        } else {
+          setStatus(
+            "Scanner error: " + (error.message || String(error))
+          );
+        }
+      }
+    }
+
+    async function detectFrame(currentSession, detector) {
+      if (currentSession !== session) {
+        return;
+      }
+
+      try {
+        if (
+          video.readyState >= 2 &&
+          video.videoWidth > 0 &&
+          video.videoHeight > 0
+        ) {
+          const barcodes = await detector.detect(video);
+
+          // Ignore results from a canceled scanning session.
+          if (currentSession !== session) {
+            return;
+          }
+
+          const found = barcodes.find(function(barcode) {
+            return (
+              typeof barcode.rawValue === "string" &&
+              barcode.rawValue.length > 0
+            );
+          });
+
+          if (found) {
+            finishScan(found.rawValue);
+            return;
+          }
+        }
+      } catch (error) {
+        if (currentSession !== session) {
+          return;
+        }
+
+        stopCamera();
+
+        setStatus(
+          "Barcode detection failed: " +
+          (error.message || String(error))
+        );
+
+        return;
+      }
+
+      if (currentSession === session) {
+        scanTimer = setTimeout(function() {
+          detectFrame(currentSession, detector);
+        }, 150);
+      }
+    }
+
+    function finishScan(code) {
+      stopCamera();
+
+      // Keep the barcode as text, including leading zeros.
+      resultInput.value = code;
+      copyButton.disabled = false;
+
+      setStatus(
+        "Barcode scanned. Copy it and return to the Data Entry tab."
+      );
+
+      if (
+        !returnOrigin ||
+        !window.opener ||
+        window.opener.closed
+      ) {
+        return;
+      }
+
+      try {
+        waitingForAcknowledgment = true;
+
+        setStatus("Returning barcode to the Data Entry form...");
+
+        window.opener.postMessage(
+          {
+            type: "BARCODE_RESULT",
+            token: returnToken,
+            barcode: code
+          },
+          returnOrigin
+        );
+
+        acknowledgmentTimer = setTimeout(function() {
+          if (waitingForAcknowledgment) {
+            waitingForAcknowledgment = false;
+
+            setStatus(
+              "Automatic return was not confirmed. Tap Copy code, " +
+              "then paste it into the Data Entry form."
+            );
+          }
+        }, 2500);
+      } catch (error) {
+        waitingForAcknowledgment = false;
+
+        setStatus(
+          "Barcode scanned. Tap Copy code and paste it into " +
+          "the Data Entry form."
+        );
+      }
+    }
+
+    window.addEventListener("message", function(event) {
+      const message = event.data;
+
+      if (
+        !waitingForAcknowledgment ||
+        event.origin !== returnOrigin ||
+        event.source !== window.opener ||
+        !message ||
+        message.type !== "BARCODE_RECEIVED" ||
+        message.token !== returnToken
+      ) {
+        return;
+      }
+
+      waitingForAcknowledgment = false;
+      clearTimeout(acknowledgmentTimer);
+
+      setStatus(
+        "Barcode returned successfully. You can close this tab."
+      );
+
+      // Works when the browser permits closing this script-opened tab.
+      window.close();
+    });
+
+    startButton.addEventListener("click", startCamera);
+
+    stopButton.addEventListener("click", function() {
+      stopCamera();
+      setStatus("Camera stopped.");
+    });
+
+    copyButton.addEventListener("click", async function() {
+      try {
+        await navigator.clipboard.writeText(resultInput.value);
+
+        setStatus(
+          "Code copied. Return to Data Entry and paste it into " +
+          "Barcode / Code."
+        );
+      } catch (error) {
+        resultInput.focus();
+        resultInput.select();
+
+        setStatus(
+          "Select and copy the code above, then return to Data Entry."
+        );
+      }
+    });
+
+    document.addEventListener("visibilitychange", function() {
+      if (document.hidden) {
+        const wasStartingOrScanning = startButton.disabled;
+
+        stopCamera();
+
+        if (wasStartingOrScanning) {
+          setStatus(
+            "Camera paused. Tap Start camera when you return."
+          );
+        }
+      }
+    });
+
+    window.addEventListener("pagehide", stopCamera);
+  </script>
 </body>
 </html>
